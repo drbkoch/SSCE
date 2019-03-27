@@ -1,359 +1,647 @@
-library(truncnorm) 
-library(MCMCpack) 
+library(msm)
+library(mnormt)
+library(mgcv)
+library(MCMCpack)
 library(parcor)
 
-#Xorig: nxp matrix of covariates 
-#Yorig: nx1 vector of outcomes
-#Aorig: nx1 binary vector indicating treatment assignment
-#tau.2: shrinkage parameter (set to large value to remove shrinkage bias; default is 1000) 
-#M: number of MCMC iterations
-#burn: number of burn-in iterations
-SSCE <- function(Xorig, Yorig, Aorig, tau.2 = 1000, M = 5000, burn = 0, Bilevel = TRUE){
-	#this stores outcome coefficients at each MCMC iteration 
-	beta.sv <- list()
+EmpBayes <- function(X, Y, A){
+
+	d <- dim(X)
 	
-	#this stores treatment coefficients at each MCMC iteration 
-	gamma.sv <- list()
+	p <- d[2]
 	
-	#this stores pi_0 at each MCMC iteration
-	pi_0.sv <- list()
+	n <- d[1]
 	
-	#this stores sigma.2 at each MCMC iteration
-	sigma.2.sv <- list()
+	eta <- solve(t(cbind(X,1))%*%cbind(X, 1))%*%t(cbind(X, 1))%*%A
 
-	#number of covariates
-	p <- ncol(Xorig)
+	lasso.fit <- lapply(1:p, function(i) adalasso(X[,-i], X[,i], k = 10, intercept = FALSE, both = FALSE))
 
-	#sample size
-	n <- nrow(Xorig)
-
-	#transform covariates to have mean zero and unit variance
-	Xstd <- cbind(t(t(Xorig - matrix(rep(apply(Xorig, 2, mean), nrow(Xorig)), 
-		nrow(Xorig),byrow=TRUE))*(1/apply(Xorig, 2, sd))), 1, Aorig)
-
-	#initialize beta to zero
-	beta <- rep(0, p+2)
-
-	#initialize gamma to zero
-	gamma <- rep(0, p+1)
-
-	#initialize pi_0
-	pi_0 <- 0.5
-
-	#initialize sigma.2
-	sigma.2 <- 1
-
-	#these two variables are used in computations in the Gibbs sampler below
-	Sigma <- 1/(n - 1 + 1/tau.2)
-	D.tau.inv <-diag(rep(1/tau.2, p))
-
-		#############################################################
-		######This block is used to estimate parameters for Bilevel SSCE#############
-		##################################################################
-
-		#To use the lasso on the outcome model, we will transform the outcome so that
-		#we do not need to estimate an intercept or the main effect of treatment 
-		##Such a transformation is not necessary but allows for all lasso software to be used
-		##in this situation: an alternative is to include the intercept and main effect of treatment
-		##in the model and not penalize their coefficients (i.e., not shrink them toward zero)
-
-		#this is used in the transformation of the outcome
-		Anew <- ifelse(Aorig == 1, 1, -1)
-
-		#mean of outcome among treated (used in the transformation of the outcome)
-		meanYtrt <- mean(Yorig[Anew == 1])
-
-		#mean of outcome among untreated (used in the transformation of the outcome)
-		meanYcont <- mean(Yorig[Anew == -1])
-
-		#mean of each covariate among the treated (used in the transformation of the outcome)
-		meanXtrt <- unlist(lapply(1:ncol(Xorig), function(i) mean(Xorig[Anew==1,i]))) 
-
-		#mean of each covariate among the untreated (used in the transformation of the outcome)
-		meanXcont <- unlist(lapply(1:ncol(Xorig), function(i) mean(Xorig[Anew==-1,i]))) 
+	lasso.coef <- lapply(1:p, function(i) lasso.fit[[i]]$coefficients.lasso)
 	
-		#used in the transformation of the outcome
-		stdx <- unlist(lapply(1:p, function(i) sd(Xorig[,i] - (1/2)*(Anew + 1)*meanXtrt[i] - (1/2)*(1 -			
-			Anew)*meanXcont[i])))
+	sigma2.x_xj <- unlist(lapply(1:p, function(i) 
+		(t(X[,i] - X[,-i]%*%lasso.coef[[i]])%*%(X[,i] - X[,-i]%*%lasso.coef[[i]]))/(n-sum(ifelse(lasso.coef[[i]]==0, 0, 1))) )
+		)
+		
+	lasso.fit <- lapply(1:p, function(i) adalasso(cbind(X[,-i], A), X[,i], k = 10, intercept = TRUE, both = FALSE))
+
+	lasso.coef <- lapply(1:p, function(i) lasso.fit[[i]]$coefficients.lasso)
 	
-		#create transformed covariate matrix so that covariates have mean zero and sd=1
-		Xout <- matrix(
-			unlist(lapply(1:p, function(i) (Xorig[,i] - (1/2)*(Anew + 1)*meanXtrt[i] - (1/2)*(1 - 	
-			Anew)*meanXcont[i])/stdx[i])), n, p)	
-
-		#center the outcomes so that there is no need to estimate the intercept and main effect of 			
-		#treatment (i.e., estimates for these coefficients are exactly zero after this transformation)
-		Ycent = (Yorig - (1/2)*(Anew + 1)*meanYtrt - (1/2)*(1 - Anew)*meanYcont)
-
-		#fit the lasso to the (transformed) outcome model, which now has only p parameters
-		##10 fold cv is used to choose tuning parameter lambda
-		lasso.fit <- adalasso(Xout, Ycent, k = 10, intercept = FALSE)
-
-		#get estimated lasso coefficients
-		lasso.coef <- lasso.fit$coefficients.lasso
-
-		#determine which covariate coefficients are non-zero
-		nonzero.lasso.coef <- which(lasso.coef != 0)
-
-		#find sigma.2.y_a.x for all covariates that have coefficients equal to zero according to lasso
-		temp <-  (1/(n-length(nonzero.lasso.coef)))*sum((Yorig - Xstd[,c(nonzero.lasso.coef, p+1, p+2)]
-			%*%(solve(t(Xstd[,c(nonzero.lasso.coef, p+1, p+2)])%*%Xstd[,c(nonzero.lasso.coef, p+1, p+2)])
-			%*%t(Xstd[,c(nonzero.lasso.coef, p+1, p+2)])%*%Yorig))^2) 
-
-		#set sigma.2.y_a.x to the value above for all covariates (we change the values below for covariates
-		#that are non-zero)
-		sigma.2.y_a.x <- rep(temp, p)
-
-		#find sigma.2.y_a.x for all covariates that have non-zero coefficients according to the lasso
-		temp <- unlist(lapply(nonzero.lasso.coef, function(g) 
-			(1/(n-length(nonzero.lasso.coef)))*sum((Yorig - Xstd[,c(nonzero.lasso.coef, p+1, p+2)][,-g]
-				%*%(solve(t(Xstd[,c(nonzero.lasso.coef, p+1, p+2)][,-g])%*%
-				Xstd[,c(nonzero.lasso.coef, p+1, p+2)][,-g])%*%t(Xstd[,c(nonzero.lasso.coef, p+1, p+2)][,-g])
-				%*%Yorig))^2)  ))
+	sigma2.x_xj.A <- unlist(lapply(1:p, function(i) 
+		(t(X[,i] - cbind(X[,-i], A)%*%lasso.coef[[i]] - lasso.fit[[i]]$intercept.lasso)%*%
+			(X[,i] - cbind(X[,-i], A)%*%lasso.coef[[i]] - lasso.fit[[i]]$intercept.lasso))/
+				(n-1-sum(ifelse(lasso.coef[[i]]==0, 0, 1))) )
+		)
+		
+	lasso.fit <- adalasso(cbind(X, A), Y, k = 10, intercept = TRUE, both = FALSE)
 	
-		#set sigma.2.y_a.x to the values above for the covariates with non-zero coefficients
-		sigma.2.y_a.x[nonzero.lasso.coef] <- temp	
+	nonzero.coef <- which(lasso.fit$coefficients.lasso != 0)
+
+	temp <- (t(Y - cbind(X, A)%*%lasso.fit$coefficients.lasso - lasso.fit$intercept.lasso)%*%
+			(Y - cbind(X, A)%*%lasso.fit$coefficients.lasso - lasso.fit$intercept.lasso))/
+				(n-1-sum(ifelse(lasso.fit$coefficients.lasso==0, 0, 1))) 
+
+	sigma2.y_x.A  <- rep(temp, p+1)
 	
-		#set values for the other parameters in Bilevel SSCE	
-		sigma.2.a_x <- rep(1, p)	
-		sigma.2.z_a.x <- rep(1, p)
-		sigma.2.z_x <- rep(1, p)
-
-		##################################################################
-		######End of block used to estimate parameters for Bilevel SSCE#############
-		##################################################################
+	lasso.fit <- lapply(1:length(nonzero.coef), function(i) 
+		adalasso(cbind(X[,-nonzero.coef[i]], A), Y, k = 10, intercept = TRUE, both = FALSE))
 
 
-	#############START GIBBS SAMPLER##################
-	for(iter in 1:(burn+M)){
-		#Draw Astar
-		Astar <- ifelse(Aorig == 1, rtruncnorm(n=1,a = 0, b = Inf, mean = Xstd[,-(p+2)]%*%gamma, sd = 1), 
-			rtruncnorm(n=1, a = -Inf, b = 0, mean = Xstd[,-(p+2)]%*%gamma, sd=1))
+	temp <- unlist(lapply(1:length(nonzero.coef), function(i) 
+		(t(Y - cbind(X[,-nonzero.coef[i]], A)%*%lasso.fit[[i]]$coefficients.lasso - lasso.fit[[i]]$intercept.lasso)%*%
+			(Y - cbind(X[,-nonzero.coef[i]], A)%*%lasso.fit[[i]]$coefficients.lasso - lasso.fit[[i]]$intercept.lasso))/
+				(n-1-sum(ifelse(lasso.fit[[i]]$coefficients.lasso==0, 0, 1)))
+	))
+	
+	sigma2.y_x.A[nonzero.coef] <- temp
+	
+	lasso.fit <- adalasso(X, A, k = 10, intercept = TRUE, both = FALSE)
+	
+	nonzero.coef <- which(lasso.fit$coefficients.lasso != 0)
 
-	for(g in 1:p){
-		#mean of slab for outcome coefficient
-		mu.g.out <-  Sigma*t(Xstd[,g])%*%(Yorig - Xstd[,-g]%*%beta[-g])
-		#mean of slab for treatment coefficient
-		mu.g.trt <-  Sigma*t(Xstd[,g])%*%(Astar - Xstd[,-c(g,p+2)]%*%gamma[-g])
+	temp <- (t(A - X%*%lasso.fit$coefficients.lasso - lasso.fit$intercept.lasso)%*%
+			(A - X%*%lasso.fit$coefficients.lasso - lasso.fit$intercept.lasso))/
+				(n-1-sum(ifelse(lasso.fit$coefficients.lasso==0, 0, 1))) 
 
-		#draw conditional prob. coefficients are zero
-		l.g <-  pi_0/(pi_0 + (1 - pi_0)*(tau.2*tau.2)^(-1/2)*
+	sigma2.A_x  <- rep(temp, p)
+	
+	lasso.fit <- lapply(1:length(nonzero.coef), function(i) 
+		adalasso(X[,-nonzero.coef[i]], A, k = 10, intercept = TRUE, both = FALSE))
+
+	temp <- unlist(lapply(1:length(nonzero.coef), function(i) 
+		(t(A - X[,-nonzero.coef[i]]%*%lasso.fit[[i]]$coefficients.lasso - lasso.fit[[i]]$intercept.lasso)%*%
+			(A - X[,-nonzero.coef[i]]%*%lasso.fit[[i]]$coefficients.lasso - lasso.fit[[i]]$intercept.lasso))/
+				(n-1-sum(ifelse(lasso.fit[[i]]$coefficients.lasso==0, 0, 1)))
+	))
+	
+	sigma2.A_x[nonzero.coef] <- temp
+	
+	return(list(eta, sigma2.x_xj, sigma2.x_xj.A, sigma2.y_x.A, sigma2.A_x))
+}
+
+
+
+
+BSSCE_EM_lambda2 = function(Y, X, eta, sigma.2.z_x, sigma.2.z_a.x, sigma.2.y_a.x, sigma.2.a_x, Bilevel=TRUE, num_update = 100, niter = 100, group_size, sigma2,a=1, b=1,
+                           verbose = FALSE, delta=0.001, alpha=1e-1,
+                           gamma=1e-1, pi_prior=TRUE, pi=0.5,option.update="global",option.weight.group=FALSE)
+{
+  ####################################
+  # Create and Initialize parameters #
+  ####################################
+  n = length(Y)
+  p = dim(X)[2]
+  ngroup = length(group_size)
+  # initialize parameters
+  tau2 = rep(1, ngroup)
+  sigma2 = 4
+  lambda2 = 1
+  matlambda2 = rep(1,ngroup)
+  lambda2_path = rep(-1, num_update)
+  matlambda2_path = matrix(-1,ncol=ngroup,nrow=num_update)
+  l = rep(0, ngroup)
+  beta = vector(mode='list', length=ngroup)
+  for(i in 1:ngroup) beta[[i]]=rep(0, group_size[i])
+  Z = rep(0, ngroup)
+  
+  trt.int <- 0
+  out.int <- 0
+  trt.eff <- 0
+
+  ###############################
+  # avoid duplicate computation #
+  ###############################
+
+	A <- Y[(n/2+1):n]
+    
+    Astar <- A
+    
+    N1 <- sum(ifelse(Astar==0,0,1))
+    N0 <- length(A) - N1
+    
+    mu_a <- X[(n/2+1):n,seq(from=2,to=p,by=2)] %*% unlist(beta)[seq(from=2,to=p,by=2)]
+    
+  	# Draw latent variable z from its full conditional: z | \theta, y, X
+  	Astar[A == 0] <- rtnorm(N0, mean = mu_a[A == 0] + trt.int, sd = 1, lower = -Inf, upper = 0)
+  	Astar[A != 0] <- rtnorm(N1, mean = mu_a[A != 0] + trt.int, sd = 1, lower = 0, upper = Inf)
+  
+  	Y[(n/2+1):n] <- Astar
+    
+   # XtX = t(X) %*% X
+    XktY = vector(mode = "list", length = ngroup)
+    XktXk = vector(mode = "list", length = ngroup)
+    XktXmk = vector(mode = "list", length = ngroup)
+    begin_idx = 1
+    for (i in 1:ngroup) {
+        end_idx = begin_idx + group_size[i] - 1
+        Xk = X[, begin_idx:end_idx]
+        XktXk[[i]] = t(Xk) %*% Xk
+        XktXmk[[i]] = t(Xk) %*% cbind(X[, -(begin_idx:end_idx)], 
+        	c(rep(1,n/2),rep(0,n/2)), c(A,rep(0,n/2)),
+        	c(rep(0,n/2),rep(1,n/2)))
+        	
+        begin_idx = end_idx + 1
+    }
+
+
+
+
+  #####################
+  # The Gibbs Sampler #
+  #####################
+
+  for (update in 1:num_update) {
+    # print(c("updadte=",update))
+    coef = array(0, dim=c(p, niter))
+    tau2_each_update = array(0, dim=c(ngroup, niter))
+
+
+
+    for (iter in 1:niter)    {
+    	
+    	mu_a <- X[(n/2+1):n,seq(from=2,to=p,by=2)] %*% unlist(beta)[seq(from=2,to=p,by=2)]
+    
+  	# Draw latent variable z from its full conditional: z | \theta, y, X
+  	Astar[A == 0] <- rtnorm(N0, mean = mu_a[A == 0] + trt.int, sd = 1, lower = -Inf, upper = 0)
+  	Astar[A != 0] <- rtnorm(N1, mean = mu_a[A != 0] + trt.int, sd = 1, lower = 0, upper = Inf)
+  
+  	Y[(n/2+1):n] <- Astar
+    YtY = t(Y) %*% Y
+   # XtY = t(X) %*% Y
+    
+     begin_idx = 1
+    for (i in 1:ngroup) {
+        end_idx = begin_idx + group_size[i] - 1
+        Xk = X[, begin_idx:end_idx]
+        XktY[[i]] = t(Xk) %*% Y
+        begin_idx = end_idx + 1
+    }
+
+      # print the current number of iteration
+      if (verbose == TRUE) {print(iter)}
+
+      # Update beta's
+      for(i in 1:ngroup)
+      {
+        bmk = c()
+        for(j in 1:ngroup)
+        {
+          if(j!=i) bmk = c(bmk, beta[[j]])
+        }
+        
+        bmk[p-1] <- out.int
+        bmk[p] <- trt.eff
+        bmk[p+1] <- trt.int
+
+        f1 = XktY[[i]] - XktXmk[[i]] %*% bmk
+        f2 = XktXk[[i]]+1/tau2[i]*diag(nrow=group_size[i])
+        f2_inverse = solve(f2)
+        mu = f2_inverse %*% f1
+
+		Sigma = 1/(n/2 - 1 + 1/tau2[i])
+		
+		mean.betaj <- mu[1]
+		var.betaj <- sigma2*f2_inverse[1,1]
+		
+		
+			mse_change_fncn <- function(b1){
+			var_small <- sigma.2.y_a.x[i]/sigma.2.a_x[i]*1/(n/2)
+
+			var_big <- (sigma.2.y_a.x[i] - sigma.2.z_a.x[i]*b1^2)/
+			    (sigma.2.a_x[i] - sigma.2.z_x[i]*(eta[i])^2)/(n/2)
+   
+			bias <- (b1*eta[i]*sigma.2.z_x[i])/sigma.2.a_x[i]
+
+			MSE_change <- bias^2 + var_small - var_big
+			ifelse(MSE_change < 0, 0, 1)
+			}
+
+			t<-apply(X=matrix(seq(-2, 0, by=.001),nrow=2001,ncol=1), MARGIN=2,FUN=mse_change_fncn)
+
+			if(length(which(t==0)) > 0){
+			  	lower.lim <- seq(-2, 0, by=.001)[which(t == 0)[1]]
+			  	upper.lim <- -1*lower.lim
+				int1 <- pnorm(q = lower.lim, mean = mean.betaj, sd = sqrt(var.betaj))
+				int2 <- pnorm(q = upper.lim, mean = mean.betaj, sd = sqrt(var.betaj))				
+				
+				area <- int2 - int1
+			}else{
+				area <- 0
+			} 	
+		
+		newpiece <- 1 - area
+			
+        l[i] = pi/(pi + (1 - pi)*newpiece*(tau2[i]*tau2[i])^(-1/2)*
 			(Sigma*Sigma)^(1/2)*exp(
-			(1/2)*((1/sigma.2)*(Sigma^(1/2)*t(Xstd[,g])%*%(Yorig - Xstd[,-g]%*%beta[-g]))^2 + 		
-    		(Sigma^(1/2)*t(Xstd[,g])%*%(Astar - Xstd[,-c(g,p+2)]%*%gamma[-g]))^2)))
-		
-		#draw indicators denoting which coefficients are zero/non-zero				
-		zero.ind <- rbinom(1, 1, l.g)
+			(1/2)*((1/sigma2)*(Sigma^(1/2)*t(X[1:(n/2),(2*i-1)])%*%(Y[1:(n/2)] - cbind(X[1:(n/2),seq(1,p,2)[-i]],1,A)%*%c(unlist(beta)[seq(1,p,2)][-i],out.int,trt.eff)))^2 + 		
+    		(Sigma^(1/2)*t(X[1:(n/2),(2*i-1)])%*%(Astar - cbind(X[(n/2+1):n,seq(2,p,2)[-i]],1)%*%c(unlist(beta)[seq(2,p,2)][-i], trt.int)))^2)))
+    		
+    	        
 
-		#get coefficient values for SSCE or for first level of Bilevel SSCE
-		###############################################
-		if(zero.ind == 1){
-			beta[g] <- 0
-			gamma[g] <- 0
-		}else{
-			temp <- rnorm(n = 2, mean = c(mu.g.out, mu.g.trt), 
-			sd =  sqrt(c(sigma.2*Sigma, Sigma)))
-	
-			beta[g] <- temp[1]
-		
-			gamma[g] <- temp[2]
-		}
+        if(runif(1)<l[i])
+        {
+          beta[[i]] = rep(0, group_size[i])
+          Z[i] = 0
+        }else{
+
+          beta[[i]] = rmnorm(1, mean=mu, varcov=c(sigma2,1)*f2_inverse)
+          
+                  
+          Z[i] = 1
+        }
+
 		###############################################
 
-		#This is for Bilevel SSCE only
-		############################################
-		if(Bilevel == TRUE){
+
 			##For each non-zero coefficient according to SSCE, we find the change in MSE if
 			##this coefficient was set to zero; we then set the coefficients to zero if doing so
 			##improves MSE of the treatment effect estimator  
-			if(beta[g] != 0){
-			 	var_small <- sigma.2.y_a.x[g]/sigma.2.a_x[g]*1/n
-    			var_big <- (sigma.2.y_a.x[g] - sigma.2.z_a.x[g]*beta[g]^2)/
-    		 	 	(sigma.2.a_x[g] - sigma.2.z_x[g]*(gamma[g]/sqrt(2*pi))^2)/n
-    			bias <- (beta[g]*(gamma[g]/sqrt(2*pi))*sigma.2.z_x[g])/sigma.2.a_x[g] 
+			if(beta[[i]][1] != 0){
+			
+				var_small <- sigma.2.y_a.x[i]/sigma.2.a_x[i]*1/(n/2)
+				
+    			var_big <- (sigma.2.y_a.x[i] - sigma.2.z_a.x[i]*beta[[i]][1]^2)/
+    		 	 	(sigma.2.a_x[i] - sigma.2.z_x[i]*(eta[i]/1)^2)/(n/2)
+    			 	 	
+    			bias <- (beta[[i]][1]*(eta[i]/1)*sigma.2.z_x[i])/sigma.2.a_x[i] 
+    			
     			MSE_change <- bias^2 + var_small - var_big 
+    			
 				if(MSE_change < 0){
-					beta[g] <- 0
-					gamma[g] <- 0
+					beta[[i]][1] <- 0
+					beta[[i]][2] <- 0
+					Z[i] = 0
 				}
-			}
+
 		}
 		#################################################
-	}
 
-	#draw the intercept for the outcome model
-	beta[p+1] <- rnorm(1, mean = (1/n)*t(Xstd[,p+1])%*%(Yorig - Xstd[,-(p+1)]%*%beta[-(p+1)]), 
-		sd  = sqrt(sigma.2/n))
 
-	#draw the treatment effect for the outcome model
-	beta[p+2] <- rnorm(1, mean = (1/sum(Aorig))*t(Xstd[,p+2])%*%(Yorig - Xstd[,-(p+2)]%*%beta[-(p+2)]), 
-		sd  = sqrt(sigma.2/(sum(Aorig))))
+      }
+            
+          #draw the intercept for the outcome model
+		out.int <- rnorm(1, mean = (1/(n/2))*t(rep(1,n/2))%*%(Y[1:(n/2)] - cbind(X[1:(n/2),seq(1,p,2)],A)%*%c(unlist(beta)[seq(1,p,2)],trt.eff)), 
+		sd  = sqrt(sigma2/(n/2)))
 
-	#draw the intercept for the treatment model
-	gamma[p+1] <- rnorm(1, mean = (1/n)*t(Xstd[,p+1])%*%(Astar - Xstd[,-c(p+1,p+2)]%*%gamma[-(p+1)]), 
-		sd  = sqrt(1/n))
+
+		trt.eff <- rnorm(1, mean = (1/sum(A))*t(A)%*%(Y[1:(n/2)] - cbind(X[1:(n/2),seq(1,p,2)],rep(1,n/2))%*%c(unlist(beta)[seq(1,p,2)], out.int)), 
+		sd  = sqrt(sigma2/(sum(A))))
 		
-	no.non.zero <- sum(ifelse(beta[1:p] == 0, 0, 1))
+		
+		#draw the intercept for the treatment model
+		trt.int <- rnorm(1, mean = (1/(n/2))*t(rep(1,n/2))%*%(Y[(n/2+1):n] - 
+		cbind(X[(n/2+1):n,seq(2,p,2)])%*%c(unlist(beta)[seq(2,p,2)])), 
+		sd  = sqrt(1/(n/2)))
 
-	#draw sigma.2 
-	sigma.2 <- rinvgamma(1, shape = n/2 + (1/2)*no.non.zero + 0.1, 
-		scale = (1/2)*(t(Yorig - Xstd%*%beta)%*%(Yorig - Xstd%*%beta) + 
-		t(beta[1:p])%*%D.tau.inv%*%beta[1:p]) + 0.1)
+           
+   
+      # Update tau2's
+      if (option.weight.group== FALSE){
+        for(i in 1:ngroup)
+        {
+          if(Z[i]==0){tau2[i] = rgamma(1, shape=(group_size[i]+1)/2, rate=matlambda2[i]/2)}
+          else{
+          	tau2[i] = 1/rig(1, mean = sqrt(matlambda2[i]*
+          		sigma2/(beta[[i]][1]^2 + sigma2*beta[[i]][2]^2)), scale = 1/(matlambda2[i]))          	}
+        }
+      }else{
+        for(i in 1:ngroup)
+        {
+          if(Z[i]==0){tau2[i] = rgamma(1, shape=(group_size[i]+1)/2, rate=matlambda2[i]*(group_size[i])/2)}
+          else{
+          	tau2[i] = 1/rig(1, mean = sqrt(matlambda2[i] * 
+                      group_size[i] * sigma2/(beta[[i]][1]^2 + sigma2*beta[[i]][2]^2)), 
+                      scale = 1/(group_size[i] * matlambda2[i]))
+          	
+          	}
 
-	#draw p_0
-	pi_0 <- rbeta(1, 1 + p - no.non.zero, 1 + no.non.zero)
-	
-	#store parameters for this iteration
-	beta.sv[[iter]] <- beta
-	gamma.sv[[iter]] <- gamma
-	sigma.2.sv[[iter]] <- sigma.2
-	pi_0.sv[[iter]] <- pi_0	
+        }
+      }
+      tau2_each_update[,iter] = tau2
+
+      # Update sigma2
+      s=0
+      for(i in 1:ngroup)
+      {
+        s = s + sum(beta[[i]][1]^2)/tau2[i]
+      }
+      beta_vec = c()
+      for(j in 1:ngroup) beta_vec = c(beta_vec, beta[[j]])
+      coef[,iter] = beta_vec
+     
+		sigma2 = rinvgamma(1, shape = n/4 + sum(Z)/2 + alpha, scale = (t(Y[1:(n/2)])%*%Y[1:(n/2)] - 2 * t(c(beta_vec[seq(1,p,2)], out.int, trt.eff)) %*% t(cbind(X[1:(n/2),seq(1,p,2)], 1, A))%*%Y[1:(n/2)] + t(c(beta_vec[seq(1,p,2)], out.int, trt.eff)) %*% 
+            t(cbind(X[1:(n/2),seq(1,p,2)], 1, A))%*%cbind(X[1:(n/2),seq(1,p,2)], 1, A) %*% c(beta_vec[seq(1,p,2)], out.int, trt.eff) + s)/2 + gamma)
+            
+	     
+      # Update pi
+      if(pi_prior==TRUE){
+        pi = rbeta(1, shape1=a+ngroup-sum(Z), shape2=b+sum(Z))
 	}
 
-	#matrix of parameters in outcome model, each row represents one draw from the posterior
-	out.mat <-matrix(unlist(beta.sv), nrow = M + burn, ncol = p+2, 
-		byrow=TRUE)[(burn+1):(M+burn),]
+    }
 
-	#matrix of covariate coefficients in outcome model; each row represents one draw from the posterior
-	out.cov.mat <- out.mat[,1:p]
-	
-	#estimated posterior distribution of intercept in outcome model
-	out.intercept.post <- out.mat[,p+1]
-	
-	#estimated posterior distribution of treatment effect 
-	trt.effect.post <- out.mat[,p+2]
 
-	out.cov.mat2 <- ifelse(abs(out.cov.mat) <= 1e-10, 0, 1)
+    # Update lambda
+    tau2_mean = apply(tau2_each_update, 1, mean)
 
-	#this gives covariate inclusion probabilities
-	IP <- colMeans(out.cov.mat2)
+    matlambda2 = (group_size+1)/(tau2_mean*group_size)
 
-	#this finds mean of each coefficient in outcome model
-	out.cov.means <- colMeans(out.cov.mat)
-	
-	#this finds mean intercept in outcome model
-	out.intercept.mean <- mean(out.intercept.post)
-	
-	#mean treatment effect
-	mean.trt.effect <- mean(out.mat[,p+2])
+    lambda2 = (p + ngroup) / sum(tau2_mean*group_size)
 
-	#find lower limit of 95% credible interval for the treatment effect
-	lower.limit <- quantile(out.mat[,p+2], 0.025)
 
-	#find upper limit of 95% credible interval for the treatment effect
-	upper.limit <- quantile(out.mat[,p+2], 0.975)
+    if(option.update=="global") matlambda2 <- rep(lambda2,ngroup)
+    if(option.weight.group==FALSE) matlambda2 <- rep((p + ngroup) / sum(tau2_mean),ngroup)
+    matlambda2_path[update,] = matlambda2
 
-	#matrix of parameters in treatment model, each row represents one draw from the posterior
-	trt.mat <- matrix(unlist(gamma.sv), nrow = M + burn, ncol = p+1, 
-		byrow=TRUE)[(burn+1):(M+burn),]
 
-	#matrix of covariate coefficients in treatment model; each row represents one draw from the posterior
-	trt.cov.mat <- trt.mat[,1:p]
-	
-	#estimated posterior distribution of intercept in treatment model
-	trt.intercept.post <- trt.mat[,p+1]
-	
-	#mean intercept in treatment model
-	trt.intercept.mean <- mean(trt.intercept.post)
-	
-	#mean of each covariate coefficient in treatment model
-	trt.cov.means <- colMeans(trt.cov.mat)
 
-	return(list(IP=IP, mean.trt.effect = mean.trt.effect, lower.limit=lower.limit, upper.limit=upper.limit,
-		 trt.effect.post = trt.effect.post, out.cov.means = out.cov.means, 
-		 trt.cov.means = trt.cov.means, out.cov.mat = out.cov.mat, 
-		 trt.cov.mat = trt.cov.mat, out.intercept.mean = out.intercept.mean, 
-		 trt.intercept.mean = trt.intercept.mean, out.intercept.post = out.intercept.post,
-		 trt.intercept.post = trt.intercept.post))
+  }
+
+  # output the posterior mean and median as our estimator
+  pos_mean = apply(coef, 1, mean)
+  pos_median = apply(coef, 1, median)
+  list(pos_mean = pos_mean, pos_median = pos_median, coef = coef, lambda2_path = matlambda2_path)
 }
 
-####Simulated example####
 
-#set seed
-set.seed(111)
+BSSCE <- function (Y, X) 
+{
+	
+	n = length(Y)
+	p = dim(X)[2]
+	
+	E.bayes <- EmpBayes(X[1:(n/2), seq(1, p, 2)], Y[1:(n/2)], Y[(n/2+1):n])
+	
+	eta <- as.numeric(t(E.bayes[[1]]))
+	sigma.2.z_x <- E.bayes[[2]]
+	sigma.2.z_a.x <- E.bayes[[3]]
+	sigma.2.y_a.x <- E.bayes[[4]]
+	sigma.2.a_x <- E.bayes[[5]]
+	
+	Bilevel=TRUE
+	niter = 5100
+ 	burnin = 100 
+	group_size = rep(2, p/2) 
+	sigma2=1
+	a = 1 
+   	b = 1 
+	num_update = 100 
+	niter.update = 100 
+	verbose = FALSE 
+    alpha = 0.1
+	gamma = 0.1
+	pi_prior = TRUE 
+	pi = 0.5
+	update_tau = TRUE 
+    option.weight.group = FALSE
+	option.update = "global"
+ 	lambda2_update = NULL
+   	ngroup = length(group_size)
+    tau2 = rep(1, ngroup)
+    sigma2 = 4
+    l = rep(0, ngroup)
+    beta = vector(mode = "list", length = ngroup)
+    for (i in 1:ngroup) beta[[i]] = rep(0, group_size[i])
+    Z = rep(0, ngroup)
+        
+    trt.int=0
+    out.int=0
+    trt.eff=0
+    
 
-#set sample size
-n <- 250
 
-#set number of covariates
-p <- 10
- 
-#generate nxp matrix of covariates 
-X <- matrix(rnorm(n*p, mean = 1, sd = 1), n, p)
- 
-#generate linear predictor for the treatment model 
-trt.lin <- 0.2*X[,1] - 2*X[,2] + X[,5] - X[,6] + X[,7] - X[,8]
- 
-#generate probability of receiving treatment
-P <- exp(trt.lin)/(1+exp(trt.lin))
- 
-#generate treatment assignment binary indicators  
-A <- rbinom(n, 1, P)
- 
-#generate linear predictor for the outcome model
-out.lin <- 2*X[,1] + 0.2*X[,2] + 5*X[,3] + 5*X[,4]
- 
-#generate outcomes with treatment effect equal to 1
-Y <- A + out.lin + rnorm(n, mean=0, sd=1)
- 
-##use Spike and Slab Causal Estimator (SSCE)
-fit.SSCE <- SSCE(X, Y, A, tau.2 = 1000, M = 5000, burn = 0, Bilevel = FALSE)
+	A <- Y[(n/2+1):n]
+  
+    
+    if (update_tau == TRUE){
+        fit_for_lambda2 = BSSCE_EM_lambda2(Y, X, eta, sigma.2.z_x, sigma.2.z_a.x, sigma.2.y_a.x,
+        sigma.2.a_x, num_update = num_update, 
+            niter = niter.update, group_size = group_size, sigma2=sigma2,option.update = option.update, 
+            option.weight.group = option.weight.group)
+           
+            
+        lambda2 = apply(fit_for_lambda2$lambda2_path, 2, tail, 1)
+        
+    }else{
+        lambda2 <- lambda2_update
+    }
+    
+    
+    Astar <- A
+    
+    N1 <- sum(ifelse(Astar==0,0,1))
+    N0 <- length(A) - N1
+    
+    mu_a <- X[(n/2+1):n,seq(from=2,to=p,by=2)] %*% unlist(beta)[seq(from=2,to=p,by=2)]
+    
+  	Astar[A == 0] <- rtnorm(N0, mean = mu_a[A == 0] + trt.int, sd = 1, lower = -Inf, upper = 0)
+  	Astar[A != 0] <- rtnorm(N1, mean = mu_a[A != 0] + trt.int, sd = 1, lower = 0, upper = Inf)
+  
+  	Y[(n/2+1):n] <- Astar
+    
+    #XtX = t(X) %*% X
+    XktY = vector(mode = "list", length = ngroup)
+    XktXk = vector(mode = "list", length = ngroup)
+    XktXmk = vector(mode = "list", length = ngroup)
+    begin_idx = 1
+    for (i in 1:ngroup) {
+        end_idx = begin_idx + group_size[i] - 1
+        Xk = X[, begin_idx:end_idx]
+        XktXk[[i]] = t(Xk) %*% Xk
+		XktXmk[[i]] = t(Xk) %*% cbind(X[, -(begin_idx:end_idx)], 
+        	c(rep(1,n/2),rep(0,n/2)), c(A,rep(0,n/2)),
+        	c(rep(0,n/2),rep(1,n/2)))
+        	
+        begin_idx = end_idx + 1
+    }
+    coef = array(0, dim = c(p+3, niter - burnin))
+    coef_tau = array(0, dim = c(ngroup, niter))
 
-##use Bilevel Spike and Slab Causal Estimator (BSSCE)
-fit.BSSCE <- SSCE(X, Y, A, tau.2 = 1000, M = 5000, burn = 0, Bilevel = TRUE)
 
-##get mean treatment effect 
-fit.SSCE$mean.trt.effect 		
-fit.BSSCE$mean.trt.effect
 
-##get a 95% CI lower bound for the treatment effect (2.5% quantile) 
-##Note: other CI bounds can be found by working directly with posterior of treatment effect
-fit.SSCE$lower.limit
-fit.BSSCE$lower.limit
+    for (iter in 1:niter) {
+    	
+    	mu_a <- X[(n/2+1):n,seq(from=2,to=p,by=2)] %*% unlist(beta)[seq(from=2,to=p,by=2)]
+    
+  	# Draw latent variable z from its full conditional: z | \theta, y, X
+  	Astar[A == 0] <- rtnorm(N0, mean = mu_a[A == 0] + trt.int, sd = 1, lower = -Inf, upper = 0)
+  	Astar[A != 0] <- rtnorm(N1, mean = mu_a[A != 0] + trt.int, sd = 1, lower = 0, upper = Inf)
+  
+  	Y[(n/2+1):n] <- Astar
+    	YtY = t(Y) %*% Y
+    #XtY = t(X) %*% Y
+    
+     begin_idx = 1
+    for (i in 1:ngroup) {
+        end_idx = begin_idx + group_size[i] - 1
+        Xk = X[, begin_idx:end_idx]
+        XktY[[i]] = t(Xk) %*% Y
+        begin_idx = end_idx + 1
+    }
+    
+        if (verbose == TRUE) {
+            print(iter)
+        }
+       # Update beta's
+      for(i in 1:ngroup)
+      {
+        bmk = c()
+        for(j in 1:ngroup)
+        {
+          if(j!=i) bmk = c(bmk, beta[[j]])
+        }
+        
+        bmk[p-1] <- out.int
+        bmk[p] <- trt.eff
+        bmk[p+1] <- trt.int
 
-##get a 95% CI lower bound for the treatment effect (97.5% quantile) 
-##Note: other CI bounds can be found by working directly with posterior of treatment effect
-fit.SSCE$upper.limit
-fit.BSSCE$upper.limit
+        f1 = XktY[[i]] - XktXmk[[i]] %*% bmk
+        f2 = XktXk[[i]]+1/tau2[i]*diag(nrow=group_size[i])
+        f2_inverse = solve(f2)
+        mu = f2_inverse %*% f1
 
-##get histogram for the estimated posterior distribution of the treatment effect
-hist(fit.SSCE$trt.effect.post)
-hist(fit.BSSCE$trt.effect.post)
+		Sigma = 1/(n/2 - 1 + 1/tau2[i])
+		
+		mean.betaj <- mu[1]
+		var.betaj <- sigma2*f2_inverse[1,1]
+		
+		
+			mse_change_fncn <- function(b1){
+			var_small <- sigma.2.y_a.x[i]/sigma.2.a_x[i]*1/(n/2)
 
-##get covariate inclusion probabilities 
-fit.SSCE$IP
-fit.BSSCE$IP
+			var_big <- (sigma.2.y_a.x[i] - sigma.2.z_a.x[i]*b1^2)/
+			    (sigma.2.a_x[i] - sigma.2.z_x[i]*(eta[i])^2)/(n/2)
+   
+			bias <- (b1*eta[i]*sigma.2.z_x[i])/sigma.2.a_x[i]
 
-##get estimated means for each covariate coefficient in the outcome model
-fit.SSCE$out.cov.means
-fit.BSSCE$out.cov.means
+			MSE_change <- bias^2 + var_small - var_big
+			ifelse(MSE_change < 0, 0, 1)
+			}
 
-##get estimated means for each covariate coefficient in the treatment model
-fit.SSCE$trt.cov.means
-fit.BSSCE$trt.cov.means
+			t<-apply(X=matrix(seq(-2, 0, by=.001),nrow=2001,ncol=1), MARGIN=2,FUN=mse_change_fncn)
 
-##get estimated mean outcome model intercept 
-fit.SSCE$out.intercept.mean
-fit.BSSCE$out.intercept.mean
+			if(length(which(t==0)) > 0){
+			  	lower.lim <- seq(-2, 0, by=.001)[which(t == 0)[1]]
+			  	upper.lim <- -1*lower.lim
+				int1 <- pnorm(q = lower.lim, mean = mean.betaj, sd = sqrt(var.betaj))
+				int2 <- pnorm(q = upper.lim, mean = mean.betaj, sd = sqrt(var.betaj))				
+				
+				area <- int2 - int1
+			}else{
+				area <- 0
+			} 	
+		
+		newpiece <- 1 - area
+			
+        l[i] = pi/(pi + (1 - pi)*newpiece*(tau2[i]*tau2[i])^(-1/2)*
+			(Sigma*Sigma)^(1/2)*exp(
+			(1/2)*((1/sigma2)*(Sigma^(1/2)*t(X[1:(n/2),(2*i-1)])%*%(Y[1:(n/2)] - cbind(X[1:(n/2),seq(1,p,2)[-i]],1,A)%*%c(unlist(beta)[seq(1,p,2)][-i],out.int,trt.eff)))^2 + 		
+    		(Sigma^(1/2)*t(X[1:(n/2),(2*i-1)])%*%(Astar - cbind(X[(n/2+1):n,seq(2,p,2)[-i]],1)%*%c(unlist(beta)[seq(2,p,2)][-i], trt.int)))^2)))
+    		
+    	
+        if(runif(1)<l[i])
+        {
+          beta[[i]] = rep(0, group_size[i])
+          Z[i] = 0
+        }else{
 
-##get estimated mean treatment model intercept 
-fit.SSCE$trt.intercept.mean
-fit.BSSCE$trt.intercept.mean
+          beta[[i]] = rmnorm(1, mean=mu, varcov=c(sigma2,1)*f2_inverse)
+          
+                  
+          Z[i] = 1
+        }
 
-##get histogram for estimated posterior of outcome model intercept 
-hist(fit.SSCE$out.intercept.post)
-hist(fit.BSSCE$out.intercept.post)
+		###############################################
 
-##get histogram for estimated posterior of treatment model intercept 
-hist(fit.SSCE$trt.intercept.post)
-hist(fit.BSSCE$trt.intercept.post)
 
-##get histogram for estimated posterior of coefficient for 2nd covariate in outcome model 
-##Note: posterior distributions for all p covariates are available
-hist(fit.SSCE$out.cov.mat[,2])
-hist(fit.BSSCE$out.cov.mat[,2])
+			##For each non-zero coefficient according to SSCE, we find the change in MSE if
+			##this coefficient was set to zero; we then set the coefficients to zero if doing so
+			##improves MSE of the treatment effect estimator  
+			if(beta[[i]][1] != 0){
+			
+				var_small <- sigma.2.y_a.x[i]/sigma.2.a_x[i]*1/(n/2)
+				
+    			var_big <- (sigma.2.y_a.x[i] - sigma.2.z_a.x[i]*beta[[i]][1]^2)/
+    		 	 	(sigma.2.a_x[i] - sigma.2.z_x[i]*(eta[i]/1)^2)/(n/2)
+    			 	 	
+    			bias <- (beta[[i]][1]*(eta[i]/1)*sigma.2.z_x[i])/sigma.2.a_x[i] 
+    			
+    			MSE_change <- bias^2 + var_small - var_big 
+    			
+				if(MSE_change < 0){
+					beta[[i]][1] <- 0
+					beta[[i]][2] <- 0
+					Z[i] = 0
+				}
 
-##get histogram for estimated posterior of coefficient for 5th covariate in treatment model 
-##Note: posterior distributions for all p covariates are available
-hist(fit.SSCE$trt.cov.mat[,5])
-hist(fit.BSSCE$trt.cov.mat[,5])
+		}
+		#################################################
+
+
+      }
+        
+        #draw the intercept for the outcome model
+		out.int <- rnorm(1, mean = (1/(n/2))*t(rep(1,n/2))%*%(Y[1:(n/2)] - cbind(X[1:(n/2),seq(1,p,2)],A)%*%c(unlist(beta)[seq(1,p,2)],trt.eff)), 
+		sd  = sqrt(sigma2/(n/2)))
+
+
+		trt.eff <- rnorm(1, mean = (1/sum(A))*t(A)%*%(Y[1:(n/2)] - cbind(X[1:(n/2),seq(1,p,2)],rep(1,n/2))%*%c(unlist(beta)[seq(1,p,2)], out.int)), 
+		sd  = sqrt(sigma2/(sum(A))))
+		
+		#draw the intercept for the treatment model
+		trt.int <- rnorm(1, mean = (1/(n/2))*t(rep(1,n/2))%*%(Y[(n/2+1):n] - 
+		cbind(X[(n/2+1):n,seq(2,p,2)])%*%c(unlist(beta)[seq(2,p,2)])), 
+		sd  = sqrt(1/(n/2)))
+
+        
+        
+        if (update_tau) {
+            if (option.weight.group == FALSE) {
+                for (i in 1:ngroup) {
+                  if (Z[i] == 0) {
+                    tau2[i] = rgamma(1, shape = (group_size[i] + 
+                      1)/2, rate = lambda2[i]/2)
+                  }
+                  else {
+                    tau2[i] = 1/rig(1, mean = sqrt(lambda2[i]*
+          		sigma2/(beta[[i]][1]^2 + sigma2*beta[[i]][2]^2)), scale = 1/(lambda2[i]))
+                      
+                  }
+                }
+            }
+            else {
+                for (i in 1:ngroup) {
+                  if (Z[i] == 0) {
+                    tau2[i] = rgamma(1, shape = (group_size[i] + 
+                      1)/2, rate = lambda2[i] * (group_size[i])/2)
+                  }
+                  else {
+                    tau2[i] = 1/rig(1, mean = sqrt(lambda2[i] * 
+                      group_size[i] * sigma2/(beta[[i]][1]^2 + sigma2*beta[[i]][2]^2)), 
+                      scale = 1/(group_size[i] * lambda2[i]))
+                     
+                  }
+                  coef_tau[i, iter] = tau2[i]
+                }
+            }
+        }
+        s = 0
+        for (i in 1:ngroup) {
+            s = s + sum(beta[[i]][1]^2)/tau2[i]
+        }
+        beta_vec = c()
+        for (j in 1:ngroup) beta_vec = c(beta_vec, beta[[j]])
+        if (iter > burnin) 
+            coef[, iter - burnin] = c(beta_vec, out.int,trt.eff,trt.int)
+           
+		sigma2 = rinvgamma(1, shape = n/4 + sum(Z)/2 + alpha, scale = (t(Y[1:(n/2)])%*%Y[1:(n/2)] - 2 * t(c(beta_vec[seq(1,p,2)], out.int, trt.eff)) %*% t(cbind(X[1:(n/2),seq(1,p,2)], 1, A))%*%Y[1:(n/2)] + t(c(beta_vec[seq(1,p,2)], out.int, trt.eff)) %*% 
+            t(cbind(X[1:(n/2),seq(1,p,2)], 1, A))%*%cbind(X[1:(n/2),seq(1,p,2)], 1, A) %*% c(beta_vec[seq(1,p,2)], out.int, trt.eff) + s)/2 + gamma)
+            
+   
+        if (pi_prior == TRUE) 
+                pi = rbeta(1, shape1=a+ngroup-sum(Z), shape2=b+sum(Z))
+
+    }
+    pos_mean = apply(coef, 1, mean)
+    pos_median = apply(coef, 1, median)
+    list(pos_mean = pos_mean, pos_median = pos_median, coef = coef)
+}
